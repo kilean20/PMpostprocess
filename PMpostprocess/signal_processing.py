@@ -28,7 +28,7 @@ def wire_convolution_kernel(x, r):
 
 
 def gaussian_convolution_kernel(x, sigma):
-    if sigma < 1e-10:
+    if sigma < 1e-3*(np.max(x)-np.min(x)):
         kernel = np.ones_like(x)
     else:
         x = x-np.mean(x)
@@ -63,6 +63,8 @@ def richardson_lucy_deconvolution(signal, kernel, iterations=20, reg_kernel=None
     """
     minval = np.min(signal)
     maxval = np.max(signal)
+    if maxval-minval == 0:
+        return signal
     eps = 1e-3
     s = (signal + minval)/(maxval-minval) + eps
     kernel_flipped = kernel[::-1]  # Flip kernel for convolution
@@ -192,30 +194,55 @@ def deconvolve_fit(positions, signal, kernel, initial_guess=None, initial_lambda
     return result
     
 def measure_rms_size(positions,signal):
+    if len(signal) < 3 or np.nanmax(signal) == np.nanmin(signal) or np.all(np.isnan(signal)):
+        return 0
     positions_mean = np.sum(positions * signal) / np.sum(signal)
     shifted_positions = positions - positions_mean
     return np.sqrt(np.sum(signal * shifted_positions**2) / np.sum(signal))
     
     
-def get_istart_iend_profile(y, threshold=None):
-    y = y + np.quantile(y,0.02)
+   
+def get_istart_iend_profile(y, threshold_factor=0.005):
+    if threshold_factor is None or np.isnan(threshold_factor) or threshold_factor==0.0:
+        return 0, len(y)-1
+    threshold_factor = min(threshold_factor, 0.02)
+    y = y - np.quantile(y, threshold_factor)
     argmax = np.argmax(y)
-    if threshold is None:
-        threshold = 0.02*y[argmax]  # 2% of the maximum value
+    y_max = y[argmax]
+    threshold = threshold_factor* y_max
+
+    # # Find start index using NumPy searchsorted (efficient linear search)
+    # start_candidates = np.where(y[:argmax] <= threshold)[-1]
+    # start_index = start_candidates[-1] if start_candidates.size > 0 else 0
+    # while start_index > 0 and 0<y[start_index] < y[start_index + 1]:
+    #     start_index -= 1
     
-    # Find start index using NumPy searchsorted (efficient linear search)
-    start_candidates = np.where(y[:argmax] <= threshold)[0]
-    start_index = start_candidates[-1] if start_candidates.size > 0 else 0
-    while start_index > 0 and 0<y[start_index] < y[start_index + 1]:
+    # # Find end index
+    # end_candidates = np.where(y[argmax:] <= threshold)[0] + argmax
+    # end_index = end_candidates[0] if end_candidates.size > 0 else len(y) - 1
+    # while end_index < len(y) - 1 and 0<y[end_index] < y[end_index - 1]:
+    #     end_index += 1
+
+
+    #--- Modified Start Index Logic ---
+    start_index = 0
+    d = max(4,math.ceil(0.01*len(y)))
+    for start_index in range(len(y)-d):
+        if np.all(y[start_index:start_index+d] > threshold):
+            break
+    while start_index > 0 and y[start_index] < y[start_index + 1]:
         start_index -= 1
-    
-    # Find end index
-    end_candidates = np.where(y[argmax:] <= threshold)[0] + argmax
-    end_index = end_candidates[0] if end_candidates.size > 0 else len(y) - 1
-    while end_index < len(y) - 1 and 0<y[end_index] < y[end_index - 1]:
-        end_index += 1
+       
+    end_index = len(y) - 1
+    for end_index in range(len(y) - 1, d - 1 , -1):
+        if np.all(y[end_index - d : end_index] > threshold):
+             break
+    while end_index < len(y) -1 and y[end_index] < y[end_index-1]:
+        end_index +=1
     
     return start_index, end_index
+    
+
 
 def estimate_noise_floor(y,start_index, end_index):
     noise_floor_region = np.concatenate([y[:start_index], y[end_index + 1:]])
@@ -229,6 +256,7 @@ def estimate_noise_floor(y,start_index, end_index):
     return noise_offset, noise_std
 
 def cut_boundary(y, start_index, end_index, offset):
+    y = np.copy(y)
     y = np.maximum(y - offset, 0)
     y[:start_index] = 0
     y[end_index:] = 0
@@ -249,9 +277,9 @@ def wire_deconvolution(x, y, r, wire_kernel_func=wire_convolution_kernel, is_x_u
         n = next_power_of_2(len(x))*extrapolate_factor
         xu = np.linspace(np.min(x),np.max(x),n)
         yu = interp1d(x, y)(xu)
-    if r < np.diff(xu).mean():
-        return xu, y
-    wire_kernel = wire_kernel_func(xu, r)        
+    if 0.3*r < 2*np.diff(xu).mean():
+        return xu, yu
+    wire_kernel = wire_kernel_func(xu, r)
     reg_kernel = gaussian_convolution_kernel(xu, 0.3*r)
     deconvolved = richardson_lucy_deconvolution(yu, wire_kernel, reg_kernel = reg_kernel)
     if finetune_deconv:
@@ -263,7 +291,7 @@ def wire_deconvolution(x, y, r, wire_kernel_func=wire_convolution_kernel, is_x_u
 def gaussian_smooth_with_deconvolution(x, y, is_x_uniform=False, extrapolate_factor=8, edge_cut=True, finetune_deconv=False):
 
     spacing = np.diff(x)
-    sigma = 2*np.mean(spacing)
+    sigma = 0.05*(np.nanmean(x) - np.nanmin(x))
     if is_x_uniform:
         xu = x
         yu = y
@@ -275,19 +303,32 @@ def gaussian_smooth_with_deconvolution(x, y, is_x_uniform=False, extrapolate_fac
     
     kernel = gaussian_convolution_kernel(xu, sigma)
     convolved = convolve(yu, kernel)
-    istart, iend = get_istart_iend_profile(convolved)
-    
-    rms_tmp = measure_rms_size(xu[istart:iend],yu[istart:iend])
+    ymax = np.max(y) - np.min(y)
+    istart, iend = get_istart_iend_profile(convolved, threshold_factor=0.1)
+    if iend - istart > 0.95*len(convolved):
+        noise_level = np.std(np.concatenate((yu[:istart], yu[iend:])) - np.concatenate((convolved[:istart], convolved[iend:])))
+        threshold_factor = 0.5*noise_level/ymax
+    else:
+        threshold_factor = 0.01
+    istart, iend = get_istart_iend_profile(convolved, threshold_factor=threshold_factor)
+
+    rms_tmp = measure_rms_size(xu[istart:iend],convolved[istart:iend])
     if 0.15*rms_tmp < sigma:
         sigma = 0.15*rms_tmp
-        kernel = gaussian_convolution_kernel(xu, sigma)
-        convolved = convolve(yu, kernel)
-        istart, iend = get_istart_iend_profile(convolved)
+    kernel = gaussian_convolution_kernel(xu, sigma)
+    convolved = convolve(yu, kernel)
+    if iend - istart > 0.95*len(convolved):
+        noise_level = np.std(np.concatenate((yu[:istart], yu[iend:])) - np.concatenate((convolved[:istart], convolved[iend:])))
+        threshold_factor = 0.5*noise_level/ymax
+    else:
+        threshold_factor = 0.01
+    istart, iend = get_istart_iend_profile(convolved, threshold_factor=threshold_factor)
         
     reg_kernel = gaussian_convolution_kernel(xu, 0.3*sigma)
     deconv_kernel = kernel
 
-    offset, std = estimate_noise_floor(yu,istart,iend)
+    #offset, std = estimate_noise_floor(yu,istart,iend)
+    offset = 0.0
     if edge_cut:
         convolved = cut_boundary(convolved,istart,iend,offset)
     deconvolved = richardson_lucy_deconvolution(convolved, deconv_kernel, reg_kernel = reg_kernel)
@@ -295,28 +336,37 @@ def gaussian_smooth_with_deconvolution(x, y, is_x_uniform=False, extrapolate_fac
         result = deconvolve_fit(xu, convolved, kernel, initial_guess=deconvolved, initial_lambda_reg=0.1)
         deconvolved = result.x
     if edge_cut:
-        istart, iend = get_istart_iend_profile(deconvolved)
         deconvolved = cut_boundary(deconvolved,istart,iend,offset)
         
     #convolved = interp1d(xu, convolved)(x)
     #deconvolved = interp1d(xu, deconvolved)(x)
     #istart, iend = get_istart_iend_profile(convolved)
     #return convolved, deconvolved, istart, iend
-    return xu, deconvolved
+    return xu,yu,deconvolved,istart,iend,offset
         
 def estimate_two_noise_model(y,smoothed):
-    scaler = np.max(smoothed)-np.min(smoothed)
+    y_max = np.nanmax(smoothed)
+    y_min = np.nanmin(smoothed)
+    scaler = y_max - y_min
+    if scaler == 0 or np.all(np.isnan(y)):
+        return 0.0, 0.0
+    y = (y-y_min)/scaler
+    smoothed = (smoothed-y_min)/scaler
     
-    y = y/scaler
-    smoothed = smoothed/scaler
     
-    istart, iend = get_istart_iend_profile(smoothed)
-    var_ysmooth = np.var(smoothed)
-    var_noise = np.var(y-smoothed)
+    var_ysmooth = np.nanvar(smoothed)
+    var_noise = np.nanvar(y-smoothed)
+    istart, iend = get_istart_iend_profile(smoothed, threshold_factor=0.1)
+    if iend - istart > 0.95*len(smoothed):
+        noise_level = np.std(np.concatenate((y[:istart], y[iend:])) - np.concatenate((smoothed[:istart], smoothed[iend:])))
+        threshold_factor = 0.5*noise_level
+    else:
+        threshold_factor = 0.01
+    istart, iend = get_istart_iend_profile(smoothed,threshold_factor=threshold_factor)
     
     noise_floor_offset, noise_floor_std = estimate_noise_floor(y,istart,iend)
-    y = cut_boundary(y,istart,iend,noise_floor_offset)
-    noise_signal_std = np.std(y[istart+1:iend-1]/smoothed[istart+1:iend-1])
+    # y = cut_boundary(y,istart,iend,noise_floor_offset)
+    noise_signal_std = np.std(y[istart+1:iend-1]/(smoothed[istart+1:iend-1]+1e-4))
     
     def loss(params):
         sigma1, sigma2 = params
@@ -325,27 +375,28 @@ def estimate_two_noise_model(y,smoothed):
         return 0.1*(estimated_var_noise/var_noise-1)**2 + 0.9*regularization
 
     result = minimize(loss, [noise_floor_std,noise_signal_std], bounds=[(0, 0.2), (0, 0.2)])
-    noise_floor_std,noise_signal_std = result.x[0]*scaler,result.x[1]
+    noise_floor_std,noise_signal_std = result.x[0]*scaler,result.x[1]  # sigma2 do not need to be scaled
     
     return noise_floor_std,noise_signal_std
 
-def smooth_n_wire_deconvolve(x,y,r,extrapolate_factor=8):#,finetune_deconv=False):
+def smooth_n_wire_deconvolve(x,y,r,extrapolate_factor=8,finetune_deconv=False):
     """
     x : position array
     y : signal array
     r : wire radius
     """    
-    xu, smoothed = gaussian_smooth_with_deconvolution(x, y,is_x_uniform=False,extrapolate_factor=extrapolate_factor)
-    yu = interp1d(x, y)(xu)
+    if np.nanmax(y) - np.nanmin(y) == 0.0 or np.all(np.isnan(y)):
+        return np.zeros(len(y)), np.zeros(len(y)), 0.0, 0.0, 0.0
+    xu, yu, smoothed,istart,iend,offset = gaussian_smooth_with_deconvolution(x, y,is_x_uniform=False,
+                                                                                 extrapolate_factor=extrapolate_factor)
     n = len(xu)
     if r is not None and r > 0:
-        xu, wire_deconvolved = wire_deconvolution(xu,smoothed,r,is_x_uniform=True)
+        xu, wire_deconvolved = wire_deconvolution(xu,smoothed,r,is_x_uniform=True,finetune_deconv=finetune_deconv)
     else:
         wire_deconvolved = smoothed
-    
-    istart, iend = get_istart_iend_profile(smoothed)
-    noise_offset, _ = estimate_noise_floor(yu,istart,iend)
-    yu = cut_boundary(yu,istart,iend,noise_offset)
+
+    yu = cut_boundary(yu,istart,iend,offset)
+    wire_deconvolved = cut_boundary(wire_deconvolved,istart,iend, 0.0)  # smoothed already cut the noise floor
     
     rms_beam_size   = measure_rms_size(xu, yu)
     rms_smooth_size = measure_rms_size(xu, smoothed)
@@ -354,7 +405,7 @@ def smooth_n_wire_deconvolve(x,y,r,extrapolate_factor=8):#,finetune_deconv=False
     smoothed = interp1d(xu,smoothed)(x)
     wire_deconvolved = interp1d(xu,wire_deconvolved)(x)
     
-    return smoothed, wire_deconvolved, rms_beam_size, rms_smooth_size, rms_deconv_size
+    return smoothed, wire_deconvolved, rms_beam_size, rms_smooth_size, rms_deconv_size, xu[istart], xu[iend], offset
     
     
 def rms_uncertainty_quantification(x,smoothed, noise_floor_std, noise_signal_std, r=None, nMC=32, extrapolate_factor = 2):
@@ -362,32 +413,43 @@ def rms_uncertainty_quantification(x,smoothed, noise_floor_std, noise_signal_std
     arr_smooth_rms = np.zeros(nMC)
     arr_noisy_rms = np.zeros(nMC)
     arr_y_samples = np.zeros((nMC,len(x)))
-    for i in range(nMC):
-        y_ = smoothed*(1+noise_signal_std*np.random.randn(*x.shape)) + noise_floor_std*np.random.randn(*x.shape)
-        _,_, noisy_rms, smooth_rms, deconv_rms = smooth_n_wire_deconvolve(x,y_,r,extrapolate_factor=extrapolate_factor)
-        arr_smooth_rms[i] = smooth_rms
-        arr_deconv_rms[i] = deconv_rms
-        arr_noisy_rms[i] = noisy_rms
-        arr_y_samples[i] = y_
-
+    if noise_floor_std != 0 and noise_signal_std != 0:
+        for i in range(nMC):
+            y_ = smoothed*(1+noise_signal_std*np.random.randn(*x.shape)) + noise_floor_std*np.random.randn(*x.shape)
+            _,_, noisy_rms, smooth_rms, deconv_rms, xstart, xend, offset = smooth_n_wire_deconvolve(x,y_,r,extrapolate_factor=extrapolate_factor)
+            arr_smooth_rms[i] = smooth_rms
+            arr_deconv_rms[i] = deconv_rms
+            arr_noisy_rms[i] = noisy_rms
+            arr_y_samples[i] = y_
 
     # arr_deconv_rms = arr_deconv_rms[np.logical_not(np.isnan(arr_deconv_rms))]
     # Calculating statistics
     # smooth_mean, smooth_std = np.nanmean(arr_smooth_rms), np.nanstd(arr_smooth_rms)
     # deconv_mean, deconv_std = np.nanmean(arr_deconv_rms), np.nanstd(arr_deconv_rms)
     # noisy_mean , noisy_std  = np.nanmean(arr_noisy_rms), np.nanstd(arr_noisy_rms)
+    smooth_std = np.nanstd(arr_smooth_rms)
+    deconv_std = np.nanstd(arr_deconv_rms)
+    noisy_std  = np.nanstd(arr_noisy_rms)
 
     return {"arr_deconv_rms": arr_deconv_rms,
             "arr_y_samples": arr_y_samples,
+            "noisy_std":noisy_std,
+            "smooth_std":smooth_std,
+            "deconv_std":deconv_std,
             }
 
     
 def process_profile_signal(x,y,r):
-    smoothed, wire_deconvolved, rms_noisy, rms_smooth, rms_deconv = smooth_n_wire_deconvolve(x, y, r)
+    smoothed, wire_deconvolved, rms_noisy, rms_smooth, rms_deconv, xstart, xend, offset = smooth_n_wire_deconvolve(x, y, r,finetune_deconv=True)
     noise_floor_std, noise_signal_std = estimate_two_noise_model(y, smoothed)
     stat = rms_uncertainty_quantification(x, smoothed, noise_floor_std, noise_signal_std, r, nMC=20)
     
     return {
+        "x":x,
+        "y":y,
+        "offset": offset,
+        "xstart": xstart,
+        "xend": xend,
         "smoothed": smoothed,
         "wire_deconvolved": wire_deconvolved,
         "rms_noisy": rms_noisy,
@@ -449,6 +511,7 @@ def _project_L3_to_xyuv_scalar(r6in, r12in1, r12in2, par_dict):
     cxy = np.nan   
     if x != 0 and y != 0:
         cxy = -(v**2 - u**2) / (2.0 * x * y)
+        cxy = np.clip(cxy, -0.999, 0.999)
     return x, y, cxy, u, v
     
 
@@ -503,7 +566,7 @@ def _project_L3_to_xyuv_vector(r6in, r12in1, r12in2, par_dict):
     cxy = np.full_like(x, np.nan)
     valid_mask = (~np.isnan(x)) & (~np.isnan(y)) & (~np.isnan(u)) & (~np.isnan(v)) & (x != 0) & (y != 0)
     cxy[valid_mask] = -(v[valid_mask]**2 - u[valid_mask]**2) / (2.0 * x[valid_mask] * y[valid_mask])
-    
+    cxy[valid_mask] = np.clip(cxy[valid_mask], -0.999, 0.999)
     return x, y, cxy, u, v
 
 
@@ -531,3 +594,33 @@ def _compute_sqrt(value):
 #     axes[1].set_title("Differences with Smoothed Profile")
 #     # Adjust layout for better spacing
 #     plt.tight_layout()
+
+
+
+def plot_profile(x,y,smoothed,wire_deconvolved,rms_noisy,rms_smooth,rms_deconv,MC_stat,xstart,xend,offset,wire_diam=None,title=None, ylim_factor=1.4):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=96)  # Create a figure with two subplots in a row
+    axes[0].plot(x, y, color="black", label=f"Noisy Profile,  $\\sigma_x$={rms_noisy:.3f} $\\pm$ {MC_stat['noisy_std']:.3f} mm")
+    axes[0].plot(x, smoothed, color="green", label=f"Smoothed,   $\\sigma_x$={rms_smooth:.3f} $\\pm$ {MC_stat['smooth_std']:.3f} mm")
+    axes[0].plot(x, wire_deconvolved, '--', color="red", label=f"DeConvolved, $\\sigma_x$={rms_deconv:.3f} $\\pm$ {MC_stat['deconv_std']:.3f} mm")
+    axes[0].legend()
+    axes[0].vlines([xstart, xend], 0, 1.4*max(y), color="gray", linestyle="--")
+    axes[0].hlines([offset], x[0], x[-1], color="gray", linestyle="--")
+    axes[0].set_xlabel("Position (mm)")
+    axes[0].set_ylabel("Signal Strength")
+    axes[0].set_ylim(0, ylim_factor * max(y))
+    if wire_diam:
+        axes[0].set_title(f"wire-diameter: {wire_diam:.3f} $mm$")
+
+    axes[1].plot(x, y - smoothed, 'k', label="Noisy - Smoothed")
+    for i in range(4):
+        y_ = MC_stat['arr_y_samples'][i]
+        axes[1].plot(x, y_ - smoothed, ':', label=f"Sample {i+1}")
+    axes[1].set_xlabel("Position (mm)")
+    axes[1].set_ylabel("Difference")
+    axes[1].legend()
+    axes[1].set_title("Differences with Smoothed Profile")
+    # Adjust layout for better spacing
+    if title is not None:
+        fig.suptitle(title)
+    plt.tight_layout()
+    plt.show()

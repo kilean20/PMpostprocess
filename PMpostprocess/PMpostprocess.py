@@ -150,7 +150,7 @@ def reprocess_CS(FLAME_helper,ISAAC_data,raw_data):
     goal_std = fm_goals_postprocessed['df'].std()
     goal_err_mean = fm_goals_err.mean()
     
-    scaler = np.nanmean(goal_std/(goal_err_mean + 1e-4*goal_std))
+    scaler = np.nanmean(goal_std/(goal_err_mean + 2e-4*goal_std))
     fm_goals_postprocessed['err'] = fm_goals_err
     fm_goals_postprocessed['normalization_factor'] = fm_goals_err*scaler  # make loss roughly order of 1
     
@@ -162,6 +162,6 @@ def reprocess_CS(FLAME_helper,ISAAC_data,raw_data):
     CS_orig = FLAME_helper.bmstate2cs(fm_orig.bmstate)
     #CS_df = pd.DataFrame([CS_new, CS_orig], index=['CS_new', 'CS_orig'])
     
-    return CS_new, CS_orig, fm, fm_evals, fm_goals, fm_goals_postprocessed, fm_eval_result
+    return CS_new, CS_orig, fm, fm_evals, fm_goals, fm_goals_postprocessed, fm_eval_result, raw, raw_data_flist
     
     
